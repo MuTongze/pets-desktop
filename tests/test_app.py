@@ -79,6 +79,36 @@ class DesktopPetTests(unittest.TestCase):
         self.pet._typing_deadline = 0.0
         self.pet._stop_pose_sequence()
 
+    def test_input_pose_transitions_do_not_move_pet_left(self):
+        self.pet._typing_timer.stop()
+        self.pet._stop_pose_sequence()
+        self.pet.set_pet_height(340)
+        screen = self.pet._screen_geometry()
+        self.pet.move(
+            screen.right() - self.pet.width() + 1,
+            screen.bottom() - self.pet.height() + 1,
+        )
+        base_rect = QRect(self.pet.geometry())
+
+        self.pet.react_to_mouse_click("left")
+        self.assertLessEqual(
+            abs(self.pet.geometry().center().x() - base_rect.center().x()),
+            1,
+        )
+        self.pet._stop_pose_sequence()
+        self.assertEqual(self.pet.geometry(), base_rect)
+
+        self.pet.react_to_keyboard_press()
+        self.pet.react_to_keyboard_press()
+        self.assertLessEqual(
+            abs(self.pet.geometry().center().x() - base_rect.center().x()),
+            1,
+        )
+        self.pet._typing_timer.stop()
+        self.pet._typing_deadline = 0.0
+        self.pet._stop_pose_sequence()
+        self.assertEqual(self.pet.geometry(), base_rect)
+
     def test_bubble_does_not_cover_pet_when_space_is_available(self):
         pet_rect = QRect(800, 600, 210, 340)
         screen_rect = QRect(0, 0, 1920, 1080)

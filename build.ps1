@@ -25,7 +25,14 @@ if ($pyInstallerExitCode -ne 0) {
     throw "PyInstaller 打包失败，退出码：$pyInstallerExitCode"
 }
 
-$finalExe = Join-Path $projectRoot "dist\小白桌宠.exe"
+$finalFileName = -join @(
+    [char]0x5C0F,
+    [char]0x767D,
+    [char]0x684C,
+    [char]0x5BA0,
+    ".exe"
+)
+$finalExe = Join-Path $projectRoot (Join-Path "dist" $finalFileName)
 if (-not (Test-Path -LiteralPath $builtExe)) {
     throw "未找到 PyInstaller 输出：$builtExe"
 }

@@ -37,7 +37,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 
 APP_NAME = "小白桌宠"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 DEFAULT_PET_HEIGHT = 340
 MIN_PET_HEIGHT = 150
 MAX_PET_HEIGHT = 680
@@ -428,6 +428,7 @@ class DesktopPet(QWidget):
             self._pose_images[pose_name] = pixmap.toImage()
         self._active_pose = None
         self._pose_mode = None
+        self._pose_anchor_rect = None
         self._pose_sequence = []
         self._pose_sequence_index = 0
 
@@ -501,7 +502,19 @@ class DesktopPet(QWidget):
     def _set_active_pose(self, pose_name, pose_mode=None):
         if pose_name is not None and pose_name not in self._pose_pixmaps:
             raise ValueError("未知姿态资源：{}".format(pose_name))
-        old_rect = self.geometry()
+
+        if pose_name is None and self._pose_anchor_rect is not None:
+            anchor_rect = QRect(self._pose_anchor_rect)
+            self._active_pose = None
+            self._pose_anchor_rect = None
+            self.setGeometry(anchor_rect)
+            self.update()
+            return
+
+        if pose_name is not None and self._pose_anchor_rect is None:
+            self._pose_anchor_rect = QRect(self.geometry())
+
+        anchor_rect = self._pose_anchor_rect or QRect(self.geometry())
         self._active_pose = pose_name
         if pose_mode is not None:
             self._pose_mode = pose_mode
@@ -510,16 +523,15 @@ class DesktopPet(QWidget):
             1,
             round(self._pet_height * pixmap.width() / pixmap.height()),
         )
-        if old_rect.isValid():
-            center_x = old_rect.center().x()
-            bottom = old_rect.bottom()
+        if anchor_rect.isValid():
+            center_x = anchor_rect.center().x()
+            bottom = anchor_rect.bottom()
             self.setGeometry(
                 center_x - width // 2,
                 bottom - self._pet_height + 1,
                 width,
                 self._pet_height,
             )
-            self._keep_inside()
         else:
             self.resize(width, self._pet_height)
         self.update()
@@ -541,6 +553,10 @@ class DesktopPet(QWidget):
         self.update()
 
     def set_pet_height(self, height):
+        if self._active_pose is not None or self._pose_timer.isActive():
+            self._typing_timer.stop()
+            self._typing_deadline = 0.0
+            self._stop_pose_sequence()
         self._resize_to_pet_height(height)
         self.settings.setValue("pet_height", self._pet_height)
 
@@ -792,6 +808,9 @@ class DesktopPet(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._alpha_hit(event.position().toPoint()):
             self._stop_animation()
+            self._typing_timer.stop()
+            self._typing_deadline = 0.0
+            self._stop_pose_sequence()
             self.bubble.hide()
             self._reset_idle_timer()
             self._press_global = event.globalPosition().toPoint()
