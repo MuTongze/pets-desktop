@@ -1,9 +1,12 @@
 import ctypes
+import json
 import math
 import os
 import random
+import subprocess
 import sys
 import time
+import winreg
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -13,7 +16,9 @@ from PySide6.QtCore import (
     QRect,
     QRectF,
     QSettings,
+    QSharedMemory,
     Signal,
+    QTemporaryDir,
     QTimer,
     Qt,
     QVariantAnimation,
@@ -33,21 +38,165 @@ from PySide6.QtGui import (
     QPolygonF,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 APP_NAME = "豆豆桌宠"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.6.1"
 DEFAULT_PET_HEIGHT = 150
 MIN_PET_HEIGHT = 90
 MAX_PET_HEIGHT = 365
 SIZE_PRESET_VERSION = 2
+CONFIG_FILENAME = "豆豆桌宠配置.ini"
+SINGLE_INSTANCE_KEY = "DoudouDesktopPet.SingleInstance.v1"
+AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE_NAME = "DoudouDesktopPet"
 
 
 def resource_path(relative_path):
     """Return a resource path that works both in source and PyInstaller builds."""
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base_path / relative_path
+
+
+def settings_file_path():
+    if getattr(sys, "frozen", False):
+        base_path = Path(sys.executable).resolve().parent
+    else:
+        base_path = Path(__file__).resolve().parent
+    return base_path / CONFIG_FILENAME
+
+
+def file_settings(path=None):
+    target = Path(path) if path is not None else settings_file_path()
+    return QSettings(str(target), QSettings.Format.IniFormat)
+
+
+def create_single_instance_guard(key=SINGLE_INSTANCE_KEY, parent=None):
+    guard = QSharedMemory(key, parent)
+    if guard.create(1):
+        return guard
+    return None
+
+
+def autostart_command():
+    if getattr(sys, "frozen", False):
+        arguments = [str(Path(sys.executable).resolve())]
+    else:
+        arguments = [
+            str(Path(sys.executable).resolve()),
+            str(Path(__file__).resolve()),
+        ]
+    return subprocess.list2cmdline(arguments)
+
+
+def is_autostart_enabled():
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            AUTOSTART_REGISTRY_PATH,
+            0,
+            winreg.KEY_QUERY_VALUE,
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+            return bool(str(value).strip())
+    except FileNotFoundError:
+        return False
+
+
+def set_autostart_enabled(enabled):
+    if enabled:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            AUTOSTART_REGISTRY_PATH,
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.SetValueEx(
+                key,
+                AUTOSTART_VALUE_NAME,
+                0,
+                winreg.REG_SZ,
+                autostart_command(),
+            )
+        return
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            AUTOSTART_REGISTRY_PATH,
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+    except FileNotFoundError:
+        pass
+
+
+LEGACY_SETTINGS_APPS = ("DoudouDesktopPet", "XiaobaiDesktopPet")
+LEGACY_SETTINGS_KEYS = (
+    "position",
+    "pet_height",
+    "topmost",
+    "input_echo_enabled",
+    "idle_enabled",
+    "idle_interval_seconds",
+    "idle_actions",
+    "dialogues_json",
+    "settings_initialized",
+    "size_preset_version",
+)
+
+
+def migrate_legacy_registry_settings(target_settings):
+    legacy_sources = [
+        QSettings("Codex", application_name)
+        for application_name in LEGACY_SETTINGS_APPS
+    ]
+    for key in LEGACY_SETTINGS_KEYS:
+        if target_settings.contains(key):
+            continue
+        for legacy_settings in legacy_sources:
+            if legacy_settings.contains(key):
+                target_settings.setValue(key, legacy_settings.value(key))
+                break
+
+    target_settings.setValue("settings_initialized", True)
+    target_settings.sync()
+    if target_settings.status() != QSettings.Status.NoError:
+        return False
+
+    for legacy_settings in legacy_sources:
+        legacy_settings.clear()
+        legacy_settings.sync()
+    for application_name in LEGACY_SETTINGS_APPS:
+        try:
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Codex\{}".format(application_name),
+            )
+        except OSError:
+            pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Codex")
+    except OSError:
+        pass
+    return True
 
 
 def clamp(value, minimum, maximum):
@@ -302,6 +451,183 @@ class SpeechBubble(QWidget):
         )
 
 
+class DialogueEditorDialog(QDialog):
+    dialogues_changed = Signal(dict)
+
+    CATEGORY_LABELS = {
+        "jump": "点击：跳跃",
+        "squash": "点击：压扁回弹",
+        "shake": "点击：左右抖动",
+        "mouse": "跟随：鼠标点击",
+        "keyboard": "跟随：键盘输入",
+        "idle": "空闲动作",
+    }
+
+    def __init__(self, dialogues, defaults, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑豆豆的对话")
+        self.setMinimumSize(560, 440)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self._defaults = {
+            key: list(defaults.get(key, [])) for key in self.CATEGORY_LABELS
+        }
+        self._dialogues = {
+            key: list(dialogues.get(key, self._defaults[key]))
+            for key in self.CATEGORY_LABELS
+        }
+        self._current_key = None
+        self._loading_category = False
+
+        description = QLabel(
+            "选择动作分类后，可以新增、删除或双击修改句子。"
+            "输入框里的文字在关闭窗口时也会自动加入。"
+            "允许把某一类全部删空，届时该动作只播放动画，不显示气泡。"
+        )
+        description.setWordWrap(True)
+
+        self.category_combo = QComboBox()
+        for key, label in self.CATEGORY_LABELS.items():
+            self.category_combo.addItem(label, key)
+
+        self.dialogue_list = QListWidget()
+        self.dialogue_list.setAlternatingRowColors(True)
+        self.dialogue_list.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+
+        self.dialogue_input = QLineEdit()
+        self.dialogue_input.setPlaceholderText("输入一句新的短对话，按回车即可添加")
+        add_button = QPushButton("新增")
+        delete_button = QPushButton("删除选中")
+        reset_button = QPushButton("恢复本类内置对话")
+
+        input_row = QHBoxLayout()
+        input_row.addWidget(self.dialogue_input, 1)
+        input_row.addWidget(add_button)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(delete_button)
+        action_row.addWidget(reset_button)
+        action_row.addStretch(1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        button_box.button(QDialogButtonBox.StandardButton.Close).setText("完成")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(description)
+        layout.addWidget(self.category_combo)
+        layout.addWidget(self.dialogue_list, 1)
+        layout.addLayout(input_row)
+        layout.addLayout(action_row)
+        layout.addWidget(button_box)
+
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: #fffaf0;
+                color: #45352b;
+                font: 10pt "Microsoft YaHei UI";
+            }
+            QComboBox, QLineEdit, QListWidget {
+                background: white;
+                border: 1px solid #cdb9a5;
+                border-radius: 6px;
+                padding: 6px;
+            }
+            QPushButton {
+                background: #f1dac1;
+                border: 1px solid #c8aa8c;
+                border-radius: 6px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover { background: #ead0b3; }
+            """
+        )
+
+        self.category_combo.currentIndexChanged.connect(self._switch_category)
+        self.dialogue_input.returnPressed.connect(self._add_dialogue)
+        add_button.clicked.connect(self._add_dialogue)
+        delete_button.clicked.connect(self._delete_selected)
+        reset_button.clicked.connect(self._reset_current_category)
+        button_box.rejected.connect(self.reject)
+        self.dialogue_list.itemChanged.connect(self._emit_dialogues_changed)
+
+        self._switch_category(self.category_combo.currentIndex())
+
+    def _store_current_category(self):
+        if self._current_key is None:
+            return
+        values = []
+        for index in range(self.dialogue_list.count()):
+            value = self.dialogue_list.item(index).text().strip()
+            if value and value not in values:
+                values.append(value)
+        self._dialogues[self._current_key] = values
+
+    def _switch_category(self, index):
+        self._store_current_category()
+        self._current_key = self.category_combo.itemData(index)
+        self._loading_category = True
+        try:
+            self.dialogue_list.clear()
+            if self._current_key is not None:
+                self.dialogue_list.addItems(self._dialogues[self._current_key])
+        finally:
+            self._loading_category = False
+
+    def _add_dialogue(self):
+        value = self.dialogue_input.text().strip()
+        if not value:
+            return
+        existing = {
+            self.dialogue_list.item(index).text().strip()
+            for index in range(self.dialogue_list.count())
+        }
+        if value not in existing:
+            self.dialogue_list.addItem(value)
+            self.dialogue_list.scrollToBottom()
+            self._emit_dialogues_changed()
+        self.dialogue_input.clear()
+        self.dialogue_input.setFocus()
+
+    def _delete_selected(self):
+        rows = sorted(
+            {self.dialogue_list.row(item) for item in self.dialogue_list.selectedItems()},
+            reverse=True,
+        )
+        for row in rows:
+            self.dialogue_list.takeItem(row)
+        if rows:
+            self._emit_dialogues_changed()
+
+    def _reset_current_category(self):
+        if self._current_key is None:
+            return
+        self._loading_category = True
+        try:
+            self.dialogue_list.clear()
+            self.dialogue_list.addItems(self._defaults[self._current_key])
+        finally:
+            self._loading_category = False
+        self._emit_dialogues_changed()
+
+    def _emit_dialogues_changed(self, *args):
+        del args
+        if self._loading_category:
+            return
+        self._store_current_category()
+        self.dialogues_changed.emit(
+            {key: list(values) for key, values in self._dialogues.items()}
+        )
+
+    def configured_dialogues(self):
+        if self.dialogue_input.text().strip():
+            self._add_dialogue()
+        self._store_current_category()
+        return {key: list(values) for key, values in self._dialogues.items()}
+
+
 class DesktopPet(QWidget):
     IDLE_ACTIONS = {
         "yawn": "打哈欠",
@@ -364,22 +690,17 @@ class DesktopPet(QWidget):
         ],
     }
 
-    def __init__(self, enable_system_input=True):
+    def __init__(
+        self,
+        enable_system_input=True,
+        settings=None,
+        migrate_legacy=True,
+    ):
         super().__init__(None)
-        self.settings = QSettings("Codex", "DoudouDesktopPet")
+        self.settings = settings or file_settings()
+        if migrate_legacy:
+            migrate_legacy_registry_settings(self.settings)
         if not self.settings.contains("settings_initialized"):
-            legacy_settings = QSettings("Codex", "XiaobaiDesktopPet")
-            for key in (
-                "position",
-                "topmost",
-                "input_echo_enabled",
-                "idle_enabled",
-                "idle_interval_seconds",
-                "idle_actions",
-            ):
-                if legacy_settings.contains(key):
-                    self.settings.setValue(key, legacy_settings.value(key))
-            self.settings.setValue("pet_height", DEFAULT_PET_HEIGHT)
             self.settings.setValue("settings_initialized", True)
             self.settings.sync()
         if (
@@ -417,6 +738,7 @@ class DesktopPet(QWidget):
                 self._enabled_idle_actions.add(action)
         if not self._enabled_idle_actions:
             self._enabled_idle_actions = set(self.IDLE_ACTIONS.keys())
+        self._dialogues = self._load_dialogues()
         self._enable_system_input = bool(enable_system_input)
         self._pet_height = clamp(
             self.settings.value("pet_height", DEFAULT_PET_HEIGHT, type=int),
@@ -984,11 +1306,21 @@ class DesktopPet(QWidget):
         random_preview_action.triggered.connect(self.preview_random_idle_action)
         preview_menu.addAction(random_preview_action)
 
+        dialogue_action = QAction("编辑对话内容…", menu)
+        dialogue_action.triggered.connect(self.edit_dialogues)
+        menu.addAction(dialogue_action)
+
         input_echo_action = QAction("跟随鼠标和键盘", menu)
         input_echo_action.setCheckable(True)
         input_echo_action.setChecked(self._input_echo_enabled)
         input_echo_action.toggled.connect(self.set_input_echo)
         menu.addAction(input_echo_action)
+
+        autostart_action = QAction("开机自动启动", menu)
+        autostart_action.setCheckable(True)
+        autostart_action.setChecked(is_autostart_enabled())
+        autostart_action.toggled.connect(self.set_autostart)
+        menu.addAction(autostart_action)
 
         topmost_action = QAction("始终置顶", menu)
         topmost_action.setCheckable(True)
@@ -1010,6 +1342,88 @@ class DesktopPet(QWidget):
         self.show()
         self.raise_()
         self.settings.setValue("topmost", self._topmost)
+
+    def set_autostart(self, enabled):
+        try:
+            set_autostart_enabled(enabled)
+        except OSError:
+            self._show_bubble("开机自启设置失败，请检查系统权限。")
+            return
+        if enabled:
+            self._show_bubble("开机后，豆豆会自动来上班！")
+        else:
+            self._show_bubble("已关闭开机自动启动。")
+
+    def _load_dialogues(self):
+        defaults = {key: list(values) for key, values in self.DIALOGUES.items()}
+        raw_value = self.settings.value("dialogues_json", "", type=str)
+        if not raw_value:
+            return defaults
+        try:
+            saved = json.loads(raw_value)
+        except (TypeError, ValueError):
+            return defaults
+        if not isinstance(saved, dict):
+            return defaults
+
+        configured = {}
+        for key, default_values in defaults.items():
+            values = saved.get(key, default_values)
+            if not isinstance(values, list):
+                values = default_values
+            cleaned = []
+            for value in values:
+                value = str(value).strip()
+                if value and value not in cleaned:
+                    cleaned.append(value)
+            configured[key] = cleaned
+        return configured
+
+    def _save_dialogues(self):
+        raw_value = json.dumps(
+            self._dialogues,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.settings.setValue(
+            "dialogues_json",
+            raw_value,
+        )
+        self.settings.sync()
+
+    def _apply_configured_dialogues(self, dialogues):
+        configured = {}
+        for key, default_values in self.DIALOGUES.items():
+            values = dialogues.get(key, default_values)
+            cleaned = []
+            for value in values:
+                value = str(value).strip()
+                if value and value not in cleaned:
+                    cleaned.append(value)
+            configured[key] = cleaned
+        self._dialogues = configured
+        self._save_dialogues()
+
+    def edit_dialogues(self):
+        self.input_watcher.set_enabled(False)
+        self._typing_timer.stop()
+        self._typing_deadline = 0.0
+        self._stop_pose_sequence()
+        dialog = DialogueEditorDialog(self._dialogues, self.DIALOGUES, self)
+        initial_dialogues = {
+            key: list(values) for key, values in self._dialogues.items()
+        }
+        dialog.dialogues_changed.connect(self._apply_configured_dialogues)
+        try:
+            dialog.exec()
+            configured = dialog.configured_dialogues()
+            if configured != self._dialogues:
+                self._apply_configured_dialogues(configured)
+            if self._dialogues != initial_dialogues:
+                self._show_bubble("对话已经保存，豆豆记住啦！")
+        finally:
+            dialog.deleteLater()
+            self._refresh_input_watcher()
 
     def _refresh_input_watcher(self):
         self.input_watcher.set_enabled(
@@ -1082,6 +1496,8 @@ class DesktopPet(QWidget):
         self.settings.setValue("input_echo_enabled", self._input_echo_enabled)
 
     def _show_bubble(self, message):
+        if not message:
+            return
         self.bubble.show_message(
             message,
             self.frameGeometry(),
@@ -1090,11 +1506,20 @@ class DesktopPet(QWidget):
         )
 
     def _maybe_show_input_bubble(self, kind, minimum_interval=5.5):
+        message = self._random_dialogue(kind)
+        if message is None:
+            return
         now = time.monotonic()
         if now - self._last_input_bubble < minimum_interval:
             return
         self._last_input_bubble = now
-        self._show_bubble(random.choice(self.DIALOGUES[kind]))
+        self._show_bubble(message)
+
+    def _random_dialogue(self, kind):
+        values = self._dialogues.get(kind, [])
+        if not values:
+            return None
+        return random.choice(values)
 
     def react_to_mouse_click(self, button):
         if (
@@ -1215,7 +1640,7 @@ class DesktopPet(QWidget):
         kind = random.choice(tuple(self._enabled_idle_actions))
         self._start_idle_pose_action(kind)
         if random.random() < 0.42:
-            self._show_bubble(random.choice(self.DIALOGUES["idle"]))
+            self._show_bubble(self._random_dialogue("idle"))
         self._reset_idle_timer()
 
     def trigger_interaction(self):
@@ -1229,8 +1654,7 @@ class DesktopPet(QWidget):
         kinds = ("jump", "squash", "shake")
         kind = kinds[self._interaction_index % len(kinds)]
         self._interaction_index += 1
-        message = random.choice(self.DIALOGUES[kind])
-        self._show_bubble(message)
+        self._show_bubble(self._random_dialogue(kind))
         self._start_animation(kind)
 
     def _start_animation(self, kind):
@@ -1401,7 +1825,28 @@ def main():
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
-    pet = DesktopPet(enable_system_input=not smoke_test)
+    instance_guard = None
+    if not smoke_test:
+        instance_guard = create_single_instance_guard(parent=app)
+        if instance_guard is None:
+            QMessageBox.information(
+                None,
+                APP_NAME,
+                "豆豆桌宠已经在运行了，请不要重复启动。",
+            )
+            return 0
+
+    temporary_settings_dir = QTemporaryDir() if smoke_test else None
+    settings = (
+        file_settings(Path(temporary_settings_dir.path()) / CONFIG_FILENAME)
+        if temporary_settings_dir is not None
+        else file_settings()
+    )
+    pet = DesktopPet(
+        enable_system_input=not smoke_test,
+        settings=settings,
+        migrate_legacy=not smoke_test,
+    )
     app.aboutToQuit.connect(pet.save_settings)
     pet.show()
     pet.raise_()
@@ -1419,7 +1864,9 @@ def main():
         QTimer.singleShot(8600, lambda: pet.preview_idle_action("wave"))
         QTimer.singleShot(10100, app.quit)
 
-    return app.exec()
+    exit_code = app.exec()
+    del instance_guard
+    return exit_code
 
 
 if __name__ == "__main__":

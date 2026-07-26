@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,21 +10,39 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from PIL import Image
-from PySide6.QtCore import QPoint, QPointF, QRect, Qt
+from PySide6.QtCore import QPoint, QPointF, QRect, QSettings, Qt
 from PySide6.QtWidgets import QApplication
 
-from main import DesktopPet
+from main import (
+    DialogueEditorDialog,
+    DesktopPet,
+    autostart_command,
+    create_single_instance_guard,
+)
 
 
 class DesktopPetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        cls.pet = DesktopPet(enable_system_input=False)
+        cls.settings_directory = tempfile.TemporaryDirectory()
+        cls.settings_path = (
+            Path(cls.settings_directory.name) / "豆豆桌宠测试配置.ini"
+        )
+        settings = QSettings(
+            str(cls.settings_path),
+            QSettings.Format.IniFormat,
+        )
+        cls.pet = DesktopPet(
+            enable_system_input=False,
+            settings=settings,
+            migrate_legacy=False,
+        )
 
     @classmethod
     def tearDownClass(cls):
         cls.pet.close()
+        cls.settings_directory.cleanup()
 
     def test_transparent_asset_is_valid(self):
         image = Image.open(ROOT / "assets" / "pet_cropped.png")
@@ -192,6 +211,95 @@ class DesktopPetTests(unittest.TestCase):
         self.assertTrue(self.pet._pose_timer.isActive())
         self.pet._stop_pose_sequence()
         self.pet.set_idle_interval(20)
+
+    def test_dialogue_editor_supports_custom_and_empty_categories(self):
+        configured = {
+            key: list(values) for key, values in DesktopPet.DIALOGUES.items()
+        }
+        dialog = DialogueEditorDialog(configured, DesktopPet.DIALOGUES)
+        changes = []
+        dialog.dialogues_changed.connect(changes.append)
+        try:
+            self.assertEqual(dialog.category_combo.currentData(), "jump")
+            dialog.dialogue_input.setText("豆豆新增的测试对话")
+            dialog._add_dialogue()
+            values = dialog.configured_dialogues()
+            self.assertIn("豆豆新增的测试对话", values["jump"])
+            self.assertIn("豆豆新增的测试对话", changes[-1]["jump"])
+
+            dialog.dialogue_list.clear()
+            dialog.dialogue_input.setText("豆豆，跳！")
+            values = dialog.configured_dialogues()
+            self.assertEqual(values["jump"], ["豆豆，跳！"])
+
+            dialog.dialogue_list.clear()
+            dialog.dialogue_input.clear()
+            values = dialog.configured_dialogues()
+            self.assertEqual(values["jump"], [])
+
+            dialog.dialogue_input.setText("   \t  ")
+            values = dialog.configured_dialogues()
+            self.assertEqual(values["jump"], [])
+            self.assertEqual(dialog.dialogue_list.count(), 0)
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
+    def test_empty_dialogue_category_is_safe(self):
+        original_dialogues = self.pet._dialogues
+        self.pet._dialogues = {
+            key: list(values) for key, values in original_dialogues.items()
+        }
+        self.pet._dialogues["mouse"] = []
+        try:
+            self.assertIsNone(self.pet._random_dialogue("mouse"))
+            self.pet._maybe_show_input_bubble("mouse", 0)
+        finally:
+            self.pet._dialogues = original_dialogues
+
+    def test_jump_uses_the_configured_dialogue(self):
+        self.pet._stop_animation()
+        original_dialogues = self.pet._dialogues
+        original_interaction_index = self.pet._interaction_index
+        self.pet._dialogues = {
+            key: list(values) for key, values in original_dialogues.items()
+        }
+        self.pet._dialogues["jump"] = ["豆豆，跳！"]
+        self.pet._interaction_index = 0
+        try:
+            self.pet.trigger_interaction()
+            self.assertEqual(self.pet.bubble._text, "豆豆，跳！")
+        finally:
+            self.pet._stop_animation()
+            self.pet.bubble.hide()
+            self.pet._dialogues = original_dialogues
+            self.pet._interaction_index = original_interaction_index
+
+    def test_settings_are_stored_in_portable_ini_file(self):
+        self.pet.settings.sync()
+        self.assertEqual(
+            Path(self.pet.settings.fileName()).resolve(),
+            self.settings_path.resolve(),
+        )
+        self.assertEqual(
+            self.pet.settings.format(),
+            QSettings.Format.IniFormat,
+        )
+        self.assertTrue(self.settings_path.exists())
+
+    def test_single_instance_guard_rejects_second_instance(self):
+        key = "DoudouDesktopPet.Test.{}".format(os.getpid())
+        first_guard = create_single_instance_guard(key)
+        self.assertIsNotNone(first_guard)
+        try:
+            self.assertIsNone(create_single_instance_guard(key))
+        finally:
+            first_guard.detach()
+
+    def test_autostart_command_contains_current_program(self):
+        command = autostart_command()
+        self.assertIn(str(Path(sys.executable).resolve()), command)
+        self.assertIn(str(ROOT / "main.py"), command)
 
 
 if __name__ == "__main__":
