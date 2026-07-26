@@ -8,8 +8,28 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 
 & $python -m PyInstaller --noconfirm --clean (Join-Path $projectRoot "pet.spec")
-if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller 打包失败，退出码：$LASTEXITCODE"
+$pyInstallerExitCode = $LASTEXITCODE
+$builtExe = Join-Path $projectRoot "dist\XiaobaiDesktopPet.exe"
+$temporaryExe = "$builtExe.notanexecutable"
+
+if ($pyInstallerExitCode -ne 0 -and (Test-Path -LiteralPath $temporaryExe)) {
+    Start-Sleep -Seconds 2
+    & $python -c "import sys; import pefile; from PyInstaller.utils.win32 import winutils; p=sys.argv[1]; pe=pefile.PE(p, fast_load=False); pe.close(); winutils.update_exe_pe_checksum(p)" $temporaryExe
+    if ($LASTEXITCODE -eq 0) {
+        Move-Item -LiteralPath $temporaryExe -Destination $builtExe -Force
+        $pyInstallerExitCode = 0
+    }
 }
 
-Write-Host "打包完成：$projectRoot\dist\小白桌宠.exe"
+if ($pyInstallerExitCode -ne 0) {
+    throw "PyInstaller 打包失败，退出码：$pyInstallerExitCode"
+}
+
+$finalExe = Join-Path $projectRoot "dist\小白桌宠.exe"
+if (-not (Test-Path -LiteralPath $builtExe)) {
+    throw "未找到 PyInstaller 输出：$builtExe"
+}
+Copy-Item -LiteralPath $builtExe -Destination $finalExe -Force
+Remove-Item -LiteralPath $builtExe -Force
+
+Write-Host "打包完成：$finalExe"

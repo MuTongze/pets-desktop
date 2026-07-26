@@ -21,6 +21,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QFont,
     QGuiApplication,
     QIcon,
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 
 APP_NAME = "小白桌宠"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 DEFAULT_PET_HEIGHT = 340
 MIN_PET_HEIGHT = 150
 MAX_PET_HEIGHT = 680
@@ -62,6 +63,7 @@ class GlobalInputWatcher(QObject):
 
     mouse_clicked = Signal(str)
     key_pressed = Signal()
+    activity_detected = Signal()
 
     KEYBOARD_KEYS = tuple(
         list(range(0x30, 0x5B))
@@ -104,6 +106,7 @@ class GlobalInputWatcher(QObject):
         self._user32 = ctypes.windll.user32 if self._supported else None
         self._key_states = {}
         self._mouse_states = {}
+        self._last_cursor_pos = None
         self._timer = QTimer(self)
         self._timer.setInterval(28)
         self._timer.timeout.connect(self._poll)
@@ -122,6 +125,7 @@ class GlobalInputWatcher(QObject):
             name: self._is_down(virtual_key)
             for name, virtual_key in self.MOUSE_BUTTONS.items()
         }
+        self._last_cursor_pos = QCursor.pos()
 
     def set_enabled(self, enabled):
         enabled = bool(enabled and self._supported)
@@ -135,15 +139,23 @@ class GlobalInputWatcher(QObject):
             self._timer.stop()
             self._key_states.clear()
             self._mouse_states.clear()
+            self._last_cursor_pos = None
 
     def _poll(self):
         if not self._enabled:
             return
 
+        activity = False
+        cursor_pos = QCursor.pos()
+        if self._last_cursor_pos is not None and cursor_pos != self._last_cursor_pos:
+            activity = True
+        self._last_cursor_pos = cursor_pos
+
         for name, virtual_key in self.MOUSE_BUTTONS.items():
             is_down = self._is_down(virtual_key)
             if is_down and not self._mouse_states.get(name, False):
                 self.mouse_clicked.emit(name)
+                activity = True
             self._mouse_states[name] = is_down
 
         any_new_key = False
@@ -154,6 +166,9 @@ class GlobalInputWatcher(QObject):
             self._key_states[virtual_key] = is_down
         if any_new_key:
             self.key_pressed.emit()
+            activity = True
+        if activity:
+            self.activity_detected.emit()
 
 
 class SpeechBubble(QWidget):
@@ -287,6 +302,24 @@ class SpeechBubble(QWidget):
 
 
 class DesktopPet(QWidget):
+    IDLE_ACTIONS = {
+        "yawn": "打哈欠",
+        "stretch_pose": "伸懒腰",
+        "look": "左右张望",
+        "wave": "挥爪招呼",
+    }
+    POSE_FILES = {
+        "typing_left": "assets/poses_v2/typing_left.png",
+        "typing_right": "assets/poses_v2/typing_right.png",
+        "mouse_ready": "assets/poses_v2/mouse_ready.png",
+        "mouse_click": "assets/poses_v2/mouse_click.png",
+        "idle_yawn": "assets/poses_v2/idle_yawn.png",
+        "idle_stretch": "assets/poses_v2/idle_stretch.png",
+        "idle_look_left": "assets/poses_v2/idle_look_left.png",
+        "idle_look_right": "assets/poses_v2/idle_look_right.png",
+        "idle_wave": "assets/poses_v2/idle_wave.png",
+    }
+
     DIALOGUES = {
         "jump": [
             "起飞！今天也要轻盈～",
@@ -337,6 +370,30 @@ class DesktopPet(QWidget):
         self._input_echo_enabled = self.settings.value(
             "input_echo_enabled", True, type=bool
         )
+        self._idle_enabled = self.settings.value("idle_enabled", True, type=bool)
+        self._idle_interval_seconds = int(
+            clamp(
+                self.settings.value("idle_interval_seconds", 20, type=int),
+                5,
+                300,
+            )
+        )
+        saved_idle_actions = self.settings.value(
+            "idle_actions", ",".join(self.IDLE_ACTIONS.keys()), type=str
+        )
+        idle_action_migration = {
+            "nod": "yawn",
+            "stretch": "stretch_pose",
+            "look": "look",
+            "breathe": "wave",
+        }
+        self._enabled_idle_actions = set()
+        for saved_action in saved_idle_actions.split(","):
+            action = idle_action_migration.get(saved_action, saved_action)
+            if action in self.IDLE_ACTIONS:
+                self._enabled_idle_actions.add(action)
+        if not self._enabled_idle_actions:
+            self._enabled_idle_actions = set(self.IDLE_ACTIONS.keys())
         self._enable_system_input = bool(enable_system_input)
         self._pet_height = clamp(
             self.settings.value("pet_height", DEFAULT_PET_HEIGHT, type=int),
@@ -361,6 +418,18 @@ class DesktopPet(QWidget):
         if self.pet_pixmap.isNull():
             raise RuntimeError("无法加载桌宠图片资源 assets/pet_cropped.png")
         self.pet_image = self.pet_pixmap.toImage()
+        self._pose_pixmaps = {}
+        self._pose_images = {}
+        for pose_name, relative_path in self.POSE_FILES.items():
+            pixmap = QPixmap(str(resource_path(relative_path)))
+            if pixmap.isNull():
+                raise RuntimeError("无法加载完整姿态资源 {}".format(relative_path))
+            self._pose_pixmaps[pose_name] = pixmap
+            self._pose_images[pose_name] = pixmap.toImage()
+        self._active_pose = None
+        self._pose_mode = None
+        self._pose_sequence = []
+        self._pose_sequence_index = 0
 
         flags = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
         if self._topmost:
@@ -378,10 +447,15 @@ class DesktopPet(QWidget):
         self.input_watcher = GlobalInputWatcher(self)
         self.input_watcher.mouse_clicked.connect(self.react_to_mouse_click)
         self.input_watcher.key_pressed.connect(self.react_to_keyboard_press)
+        self.input_watcher.activity_detected.connect(self._reset_idle_timer)
 
         self._typing_timer = QTimer(self)
-        self._typing_timer.setInterval(72)
+        self._typing_timer.setInterval(120)
         self._typing_timer.timeout.connect(self._tick_typing)
+
+        self._pose_timer = QTimer(self)
+        self._pose_timer.setSingleShot(True)
+        self._pose_timer.timeout.connect(self._advance_pose_sequence)
 
         self._idle_timer = QTimer(self)
         self._idle_timer.setSingleShot(True)
@@ -389,9 +463,7 @@ class DesktopPet(QWidget):
 
         self._resize_to_pet_height(self._pet_height, preserve_anchor=False)
         self._restore_or_place_window()
-        self.input_watcher.set_enabled(
-            self._input_echo_enabled and self._enable_system_input
-        )
+        self._refresh_input_watcher()
         self._reset_idle_timer()
 
     def _screen_geometry(self):
@@ -420,10 +492,43 @@ class DesktopPet(QWidget):
         y = clamp(self.y(), screen_rect.top(), screen_rect.bottom() - self.height() + 1)
         self.move(x, y)
 
+    def _current_pixmap(self):
+        return self._pose_pixmaps.get(self._active_pose, self.pet_pixmap)
+
+    def _current_image(self):
+        return self._pose_images.get(self._active_pose, self.pet_image)
+
+    def _set_active_pose(self, pose_name, pose_mode=None):
+        if pose_name is not None and pose_name not in self._pose_pixmaps:
+            raise ValueError("未知姿态资源：{}".format(pose_name))
+        old_rect = self.geometry()
+        self._active_pose = pose_name
+        if pose_mode is not None:
+            self._pose_mode = pose_mode
+        pixmap = self._current_pixmap()
+        width = max(
+            1,
+            round(self._pet_height * pixmap.width() / pixmap.height()),
+        )
+        if old_rect.isValid():
+            center_x = old_rect.center().x()
+            bottom = old_rect.bottom()
+            self.setGeometry(
+                center_x - width // 2,
+                bottom - self._pet_height + 1,
+                width,
+                self._pet_height,
+            )
+            self._keep_inside()
+        else:
+            self.resize(width, self._pet_height)
+        self.update()
+
     def _resize_to_pet_height(self, height, preserve_anchor=True):
         self._stop_animation()
         height = int(clamp(height, MIN_PET_HEIGHT, MAX_PET_HEIGHT))
-        width = max(1, round(height * self.pet_pixmap.width() / self.pet_pixmap.height()))
+        pixmap = self._current_pixmap()
+        width = max(1, round(height * pixmap.width() / pixmap.height()))
         old_rect = self.geometry()
         self._pet_height = height
         if preserve_anchor and old_rect.isValid():
@@ -442,22 +547,19 @@ class DesktopPet(QWidget):
     def _alpha_hit(self, point):
         if not self.rect().contains(point):
             return False
-        source_x = int(point.x() * self.pet_image.width() / max(1, self.width()))
-        source_y = int(point.y() * self.pet_image.height() / max(1, self.height()))
-        source_x = clamp(source_x, 0, self.pet_image.width() - 1)
-        source_y = clamp(source_y, 0, self.pet_image.height() - 1)
-        return self.pet_image.pixelColor(source_x, source_y).alpha() > 24
+        image = self._current_image()
+        source_x = int(point.x() * image.width() / max(1, self.width()))
+        source_y = int(point.y() * image.height() / max(1, self.height()))
+        source_x = clamp(source_x, 0, image.width() - 1)
+        source_y = clamp(source_y, 0, image.height() - 1)
+        return image.pixelColor(source_x, source_y).alpha() > 24
 
     def paintEvent(self, event):
         del event
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.drawPixmap(self.rect(), self.pet_pixmap)
-        if self._overlay_kind and self._overlay_kind.startswith("mouse_"):
-            self._draw_mouse_mimic(painter)
-        elif self._overlay_kind == "keyboard":
-            self._draw_keyboard_mimic(painter)
+        painter.drawPixmap(self.rect(), self._current_pixmap())
 
     def _draw_mouse_mimic(self, painter):
         painter.save()
@@ -480,7 +582,7 @@ class DesktopPet(QWidget):
         )
 
         painter.setPen(QPen(QColor(88, 67, 54, 245), max(1.4, mouse_width * 0.035)))
-        painter.setBrush(QColor(250, 244, 232, 245))
+        painter.setBrush(QColor(220, 234, 246, 250))
         painter.drawRoundedRect(body, mouse_width * 0.44, mouse_width * 0.44)
 
         split_y = body.top() + body.height() * 0.38
@@ -519,6 +621,31 @@ class DesktopPet(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(245, 164, 86, int(100 + flash * 150)))
         painter.drawRoundedRect(highlight, 5, 5)
+
+        tip_source = self._paw_source_rects["right_tip"]
+        scale_x = self.width() / self.pet_pixmap.width()
+        scale_y = self.height() / self.pet_pixmap.height()
+        tip_width = tip_source.width() * scale_x
+        natural_center_x = (
+            tip_source.x() * scale_x + tip_width / 2.0
+        )
+        target_center_x = body.center().x() + {
+            "left": -body.width() * 0.16,
+            "right": body.width() * 0.16,
+            "middle": 0.0,
+        }[button]
+        natural_top = tip_source.y() * scale_y
+        target_top = (
+            body.top()
+            + body.height() * 0.14
+            + body.height() * 0.13 * flash
+        )
+        self._draw_paw_sprite(
+            painter,
+            "right_tip",
+            offset_x=target_center_x - natural_center_x,
+            offset_y=target_top - natural_top,
+        )
 
         dot_radius = max(1.8, mouse_width * 0.045)
         painter.setBrush(QColor(255, 190, 88, int(70 + flash * 185)))
@@ -580,7 +707,87 @@ class DesktopPet(QWidget):
                     painter.setBrush(QColor(255, 251, 242, 245))
                     painter.setPen(QPen(QColor(157, 133, 111, 220), 0.8))
                 painter.drawRoundedRect(key, 2.2, 2.2)
+
+        phase = self._typing_phase * math.pi / 2.0
+        left_press = (math.sin(phase) + 1.0) / 2.0
+        right_press = (math.sin(phase + math.pi) + 1.0) / 2.0
+        paw_travel = max(6.0, self.height() * 0.026)
+        self._draw_paw_sprite(
+            painter,
+            "left",
+            offset_x=max(2.0, self.width() * 0.025),
+            offset_y=left_press * paw_travel,
+        )
+        self._draw_paw_sprite(
+            painter,
+            "right",
+            offset_x=-max(2.0, self.width() * 0.022),
+            offset_y=right_press * paw_travel,
+        )
         painter.restore()
+
+    def _draw_paw_sprite(self, painter, paw_name, offset_x=0.0, offset_y=0.0):
+        source_rect = self._paw_source_rects[paw_name]
+        paw_pixmap = self._paw_pixmaps[paw_name]
+        scale_x = self.width() / self.pet_pixmap.width()
+        scale_y = self.height() / self.pet_pixmap.height()
+        destination = QRectF(
+            source_rect.x() * scale_x + offset_x,
+            source_rect.y() * scale_y + offset_y,
+            source_rect.width() * scale_x,
+            source_rect.height() * scale_y,
+        )
+        painter.drawPixmap(destination, paw_pixmap, QRectF(paw_pixmap.rect()))
+
+    def _start_pose_sequence(self, sequence, mode):
+        self._stop_animation()
+        self._pose_timer.stop()
+        self._pose_sequence = list(sequence)
+        self._pose_sequence_index = 0
+        self._pose_mode = mode
+        self._advance_pose_sequence()
+
+    def _advance_pose_sequence(self):
+        if self._pose_sequence_index >= len(self._pose_sequence):
+            self._stop_pose_sequence()
+            return
+        pose_name, duration = self._pose_sequence[self._pose_sequence_index]
+        self._pose_sequence_index += 1
+        self._set_active_pose(pose_name, self._pose_mode)
+        self._pose_timer.start(int(duration))
+
+    def _stop_pose_sequence(self):
+        self._pose_timer.stop()
+        self._pose_sequence = []
+        self._pose_sequence_index = 0
+        self._pose_mode = None
+        if self._active_pose is not None:
+            self._set_active_pose(None)
+
+    def _start_idle_pose_action(self, action_name):
+        sequences = {
+            "yawn": [
+                ("idle_yawn", 1450),
+                (None, 180),
+            ],
+            "stretch_pose": [
+                ("idle_stretch", 1550),
+                (None, 200),
+            ],
+            "look": [
+                ("idle_look_left", 620),
+                (None, 150),
+                ("idle_look_right", 620),
+                (None, 180),
+            ],
+            "wave": [
+                ("idle_wave", 520),
+                (None, 180),
+                ("idle_wave", 520),
+                (None, 180),
+            ],
+        }
+        self._start_pose_sequence(sequences[action_name], "idle")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._alpha_hit(event.position().toPoint()):
@@ -669,6 +876,61 @@ class DesktopPet(QWidget):
             )
             size_menu.addAction(action)
 
+        idle_menu = menu.addMenu("空闲互动设置")
+
+        idle_enabled_action = QAction("启用空闲互动", idle_menu)
+        idle_enabled_action.setCheckable(True)
+        idle_enabled_action.setChecked(self._idle_enabled)
+        idle_enabled_action.toggled.connect(self.set_idle_enabled)
+        idle_menu.addAction(idle_enabled_action)
+
+        wait_menu = idle_menu.addMenu("等待时间")
+        wait_options = [
+            ("5 秒（快速看看）", 5),
+            ("10 秒", 10),
+            ("20 秒", 20),
+            ("30 秒", 30),
+            ("1 分钟", 60),
+            ("2 分钟", 120),
+            ("5 分钟", 300),
+        ]
+        for label, seconds in wait_options:
+            action = QAction(label, wait_menu)
+            action.setCheckable(True)
+            action.setChecked(self._idle_interval_seconds == seconds)
+            action.triggered.connect(
+                lambda checked=False, selected_seconds=seconds: self.set_idle_interval(
+                    selected_seconds
+                )
+            )
+            wait_menu.addAction(action)
+
+        action_selection_menu = idle_menu.addMenu("选择启用的动作")
+        for action_name, label in self.IDLE_ACTIONS.items():
+            action = QAction(label, action_selection_menu)
+            action.setCheckable(True)
+            action.setChecked(action_name in self._enabled_idle_actions)
+            action.toggled.connect(
+                lambda enabled, selected_action=action_name: self.set_idle_action_enabled(
+                    selected_action, enabled
+                )
+            )
+            action_selection_menu.addAction(action)
+
+        preview_menu = idle_menu.addMenu("立即预览动作")
+        for action_name, label in self.IDLE_ACTIONS.items():
+            action = QAction(label, preview_menu)
+            action.triggered.connect(
+                lambda checked=False, selected_action=action_name: self.preview_idle_action(
+                    selected_action
+                )
+            )
+            preview_menu.addAction(action)
+        preview_menu.addSeparator()
+        random_preview_action = QAction("随机预览一个", preview_menu)
+        random_preview_action.triggered.connect(self.preview_random_idle_action)
+        preview_menu.addAction(random_preview_action)
+
         input_echo_action = QAction("跟随鼠标和键盘", menu)
         input_echo_action.setCheckable(True)
         input_echo_action.setChecked(self._input_echo_enabled)
@@ -696,16 +958,71 @@ class DesktopPet(QWidget):
         self.raise_()
         self.settings.setValue("topmost", self._topmost)
 
+    def _refresh_input_watcher(self):
+        self.input_watcher.set_enabled(
+            self._enable_system_input
+            and (self._input_echo_enabled or self._idle_enabled)
+        )
+
+    def set_idle_enabled(self, enabled):
+        self._idle_enabled = bool(enabled)
+        self._refresh_input_watcher()
+        if self._idle_enabled:
+            self._reset_idle_timer()
+            self._show_bubble(
+                "空闲互动已开启，等待 {} 秒～".format(
+                    self._idle_interval_seconds
+                )
+            )
+        else:
+            self._idle_timer.stop()
+            self._show_bubble("空闲互动已暂停。")
+        self.settings.setValue("idle_enabled", self._idle_enabled)
+
+    def set_idle_interval(self, seconds):
+        self._idle_interval_seconds = int(clamp(seconds, 5, 300))
+        self.settings.setValue(
+            "idle_interval_seconds", self._idle_interval_seconds
+        )
+        self._reset_idle_timer()
+        self._show_bubble(
+            "空闲 {} 秒后表演动作！".format(self._idle_interval_seconds)
+        )
+
+    def set_idle_action_enabled(self, action_name, enabled):
+        if action_name not in self.IDLE_ACTIONS:
+            return
+        if enabled:
+            self._enabled_idle_actions.add(action_name)
+        else:
+            self._enabled_idle_actions.discard(action_name)
+        self.settings.setValue(
+            "idle_actions", ",".join(sorted(self._enabled_idle_actions))
+        )
+        self._reset_idle_timer()
+
+    def preview_idle_action(self, action_name):
+        if action_name not in self.IDLE_ACTIONS:
+            return
+        self._stop_animation()
+        self._stop_pose_sequence()
+        self._typing_timer.stop()
+        self._typing_deadline = 0.0
+        self._start_idle_pose_action(action_name)
+        self._show_bubble("动作预览：{}".format(self.IDLE_ACTIONS[action_name]))
+        self._reset_idle_timer()
+
+    def preview_random_idle_action(self):
+        self.preview_idle_action(random.choice(tuple(self.IDLE_ACTIONS.keys())))
+
     def set_input_echo(self, enabled):
         self._input_echo_enabled = bool(enabled)
-        self.input_watcher.set_enabled(
-            self._input_echo_enabled and self._enable_system_input
-        )
+        self._refresh_input_watcher()
         if not self._input_echo_enabled:
             self._typing_timer.stop()
             self._typing_deadline = 0.0
-            self._stop_overlay_animation()
-            self._overlay_kind = None
+            if self._pose_mode in ("typing", "mouse"):
+                self._stop_pose_sequence()
             self.update()
         else:
             self._show_bubble("收到！我来模仿你的操作～")
@@ -729,10 +1046,18 @@ class DesktopPet(QWidget):
     def react_to_mouse_click(self, button):
         if not self._input_echo_enabled or self._dragging:
             return
+        del button
         self._reset_idle_timer()
-        self._start_overlay("mouse_" + button, 440)
-        if self._animation is None:
-            self._start_animation("mouse_click")
+        self._typing_timer.stop()
+        self._typing_deadline = 0.0
+        self._start_pose_sequence(
+            [
+                ("mouse_ready", 110),
+                ("mouse_click", 250),
+                ("mouse_ready", 130),
+            ],
+            "mouse",
+        )
         self._maybe_show_input_bubble("mouse", 5.0)
 
     def react_to_keyboard_press(self):
@@ -740,34 +1065,34 @@ class DesktopPet(QWidget):
             return
         now = time.monotonic()
         new_burst = now >= self._typing_deadline
-        self._typing_deadline = now + 0.78
+        self._typing_deadline = now + 0.86
         self._typing_phase = (self._typing_phase + 1) % 10000
         self._reset_idle_timer()
 
-        if self._overlay_animation is not None:
-            self._stop_overlay_animation()
-        self._overlay_kind = "keyboard"
-        self._overlay_progress = 1.0
+        if self._pose_mode != "typing":
+            self._stop_pose_sequence()
+            self._stop_animation()
+            self._pose_mode = "typing"
+        pose_name = (
+            "typing_left" if self._typing_phase % 2 else "typing_right"
+        )
+        self._set_active_pose(pose_name, "typing")
         if not self._typing_timer.isActive():
             self._typing_timer.start()
-        self.update()
-
-        if self._animation is None and now - self._last_key_bob > 0.24:
-            self._last_key_bob = now
-            self._start_animation("type")
         if new_burst:
             self._maybe_show_input_bubble("keyboard", 5.5)
 
     def _tick_typing(self):
         if time.monotonic() >= self._typing_deadline:
             self._typing_timer.stop()
-            if not (self._overlay_kind or "").startswith("mouse_"):
-                self._overlay_kind = None
-                self._overlay_progress = 0.0
-                self.update()
+            if self._pose_mode == "typing":
+                self._stop_pose_sequence()
             return
         self._typing_phase = (self._typing_phase + 1) % 10000
-        self.update()
+        pose_name = (
+            "typing_left" if self._typing_phase % 2 else "typing_right"
+        )
+        self._set_active_pose(pose_name, "typing")
 
     def _start_overlay(self, kind, duration):
         self._stop_overlay_animation()
@@ -809,20 +1134,38 @@ class DesktopPet(QWidget):
             animation.deleteLater()
 
     def _reset_idle_timer(self):
-        if self._enable_system_input:
-            self._idle_timer.start(random.randint(9000, 16000))
+        if (
+            self._enable_system_input
+            and self._idle_enabled
+            and self._enabled_idle_actions
+        ):
+            self._idle_timer.start(self._idle_interval_seconds * 1000)
+        else:
+            self._idle_timer.stop()
 
     def _idle_reaction(self):
-        if self._dragging or self._animation is not None:
+        if not self._idle_enabled or not self._enabled_idle_actions:
+            self._idle_timer.stop()
+            return
+        if (
+            self._dragging
+            or self._animation is not None
+            or self._active_pose is not None
+            or self._pose_timer.isActive()
+        ):
             self._reset_idle_timer()
             return
-        kind = random.choice(("nod", "stretch", "shake"))
+        kind = random.choice(tuple(self._enabled_idle_actions))
+        self._start_idle_pose_action(kind)
         if random.random() < 0.42:
             self._show_bubble(random.choice(self.DIALOGUES["idle"]))
-        self._start_animation(kind)
         self._reset_idle_timer()
 
     def trigger_interaction(self):
+        if self._active_pose is not None or self._pose_timer.isActive():
+            self._typing_timer.stop()
+            self._typing_deadline = 0.0
+            self._stop_pose_sequence()
         if self._animation is not None:
             return
         self._reset_idle_timer()
@@ -850,6 +1193,8 @@ class DesktopPet(QWidget):
                 "type": 240,
                 "nod": 620,
                 "stretch": 880,
+                "look": 1100,
+                "breathe": 1800,
             }[kind]
         )
         animation.valueChanged.connect(
@@ -886,15 +1231,22 @@ class DesktopPet(QWidget):
                 1.0 - amount * 0.065,
             )
         elif kind == "type":
-            offset_x = round(base.width() * 0.012 * math.sin(progress * math.pi * 4.0))
-            offset_y = round(base.height() * 0.018 * math.sin(progress * math.pi))
-            self.move(base.x() + offset_x, base.y() + offset_y)
+            amount = math.sin(progress * math.pi)
+            self._set_scaled_geometry(
+                base,
+                1.0 + amount * 0.035,
+                1.0 - amount * 0.075,
+            )
+            offset_x = round(
+                base.width() * 0.016 * math.sin(progress * math.pi * 4.0)
+            )
+            self.move(self.x() + offset_x, self.y())
         elif kind == "nod":
             amount = math.sin(math.pi * progress)
             self._set_scaled_geometry(
                 base,
-                1.0 + amount * 0.018,
-                1.0 - amount * 0.045,
+                1.0 + amount * 0.035,
+                1.0 - amount * 0.09,
             )
         elif kind == "stretch":
             amount = math.sin(math.pi * progress)
@@ -902,6 +1254,22 @@ class DesktopPet(QWidget):
                 base,
                 1.0 + amount * 0.11,
                 1.0 - amount * 0.075,
+            )
+        elif kind == "look":
+            damping = 0.72 + 0.28 * (1.0 - progress)
+            offset_x = round(
+                base.width()
+                * 0.065
+                * math.sin(progress * math.pi * 3.0)
+                * damping
+            )
+            self.move(base.x() + offset_x, base.y())
+        elif kind == "breathe":
+            amount = (1.0 - math.cos(progress * math.pi * 4.0)) / 2.0
+            self._set_scaled_geometry(
+                base,
+                1.0 + amount * 0.022,
+                1.0 - amount * 0.018,
             )
         elif kind == "squash":
             if progress < 0.42:
@@ -939,16 +1307,25 @@ class DesktopPet(QWidget):
 
     def save_settings(self):
         self._stop_animation()
+        self._stop_pose_sequence()
         self.settings.setValue("position", self.pos())
         self.settings.setValue("pet_height", self._pet_height)
         self.settings.setValue("topmost", self._topmost)
         self.settings.setValue("input_echo_enabled", self._input_echo_enabled)
+        self.settings.setValue("idle_enabled", self._idle_enabled)
+        self.settings.setValue(
+            "idle_interval_seconds", self._idle_interval_seconds
+        )
+        self.settings.setValue(
+            "idle_actions", ",".join(sorted(self._enabled_idle_actions))
+        )
         self.settings.sync()
 
     def closeEvent(self, event):
         self.input_watcher.set_enabled(False)
         self._idle_timer.stop()
         self._typing_timer.stop()
+        self._pose_timer.stop()
         self._stop_overlay_animation()
         self.save_settings()
         self.bubble.close()
@@ -974,12 +1351,16 @@ def main():
 
     if smoke_test:
         QTimer.singleShot(120, lambda: pet.react_to_mouse_click("left"))
-        QTimer.singleShot(580, pet.react_to_keyboard_press)
-        QTimer.singleShot(700, pet.react_to_keyboard_press)
-        QTimer.singleShot(1080, pet.trigger_interaction)
-        QTimer.singleShot(1860, pet.trigger_interaction)
-        QTimer.singleShot(2700, pet.trigger_interaction)
-        QTimer.singleShot(3500, app.quit)
+        QTimer.singleShot(550, pet.react_to_keyboard_press)
+        QTimer.singleShot(680, pet.react_to_keyboard_press)
+        QTimer.singleShot(950, pet.trigger_interaction)
+        QTimer.singleShot(1700, pet.trigger_interaction)
+        QTimer.singleShot(2550, pet.trigger_interaction)
+        QTimer.singleShot(3300, lambda: pet.preview_idle_action("yawn"))
+        QTimer.singleShot(5000, lambda: pet.preview_idle_action("stretch_pose"))
+        QTimer.singleShot(6900, lambda: pet.preview_idle_action("look"))
+        QTimer.singleShot(8600, lambda: pet.preview_idle_action("wave"))
+        QTimer.singleShot(10100, app.quit)
 
     return app.exec()
 
