@@ -37,10 +37,11 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 
 APP_NAME = "豆豆桌宠"
-APP_VERSION = "1.4.1"
-DEFAULT_PET_HEIGHT = 300
-MIN_PET_HEIGHT = 120
-MAX_PET_HEIGHT = 520
+APP_VERSION = "1.4.2"
+DEFAULT_PET_HEIGHT = 150
+MIN_PET_HEIGHT = 90
+MAX_PET_HEIGHT = 365
+SIZE_PRESET_VERSION = 2
 
 
 def resource_path(relative_path):
@@ -380,6 +381,13 @@ class DesktopPet(QWidget):
                     self.settings.setValue(key, legacy_settings.value(key))
             self.settings.setValue("pet_height", DEFAULT_PET_HEIGHT)
             self.settings.setValue("settings_initialized", True)
+            self.settings.sync()
+        if (
+            self.settings.value("size_preset_version", 0, type=int)
+            < SIZE_PRESET_VERSION
+        ):
+            self.settings.setValue("pet_height", DEFAULT_PET_HEIGHT)
+            self.settings.setValue("size_preset_version", SIZE_PRESET_VERSION)
             self.settings.sync()
         self._topmost = self.settings.value("topmost", True, type=bool)
         self._input_echo_enabled = self.settings.value(
@@ -906,11 +914,11 @@ class DesktopPet(QWidget):
 
         size_menu = menu.addMenu("调整大小")
         size_options = [
-            ("迷你（约 90×150）", 150),
-            ("小巧（约 120×200）", 200),
-            ("标准（约 155×260）", 260),
-            ("推荐（约 180×300）", 300),
-            ("大号（约 220×365）", 365),
+            ("迷你（约 65×110）", 110),
+            ("小巧（约 80×130）", 130),
+            ("推荐（约 90×150）", 150),
+            ("标准（约 110×180）", 180),
+            ("大号（约 135×220）", 220),
         ]
         for label, height in size_options:
             action = QAction(label, size_menu)

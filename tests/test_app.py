@@ -45,11 +45,11 @@ class DesktopPetTests(unittest.TestCase):
 
     def test_pet_size_stays_in_bounds(self):
         self.pet.set_pet_height(1)
-        self.assertEqual(self.pet.height(), 120)
+        self.assertEqual(self.pet.height(), 90)
         self.pet.set_pet_height(9999)
-        self.assertEqual(self.pet.height(), 520)
-        self.pet.set_pet_height(300)
-        self.assertEqual(self.pet.height(), 300)
+        self.assertEqual(self.pet.height(), 365)
+        self.pet.set_pet_height(150)
+        self.assertEqual(self.pet.height(), 150)
 
     def test_all_animation_frames_restore_geometry(self):
         for kind in ("jump", "squash", "shake"):
@@ -110,7 +110,7 @@ class DesktopPetTests(unittest.TestCase):
 
         self.pet._typing_timer.stop()
         self.pet._stop_pose_sequence()
-        self.pet.set_pet_height(300)
+        self.pet.set_pet_height(150)
         self.pet.move(420, 300)
         drag_origin = self.pet.frameGeometry().topLeft()
         press_global = QPoint(500, 500)
@@ -137,7 +137,7 @@ class DesktopPetTests(unittest.TestCase):
     def test_input_pose_transitions_do_not_move_pet_left(self):
         self.pet._typing_timer.stop()
         self.pet._stop_pose_sequence()
-        self.pet.set_pet_height(300)
+        self.pet.set_pet_height(150)
         screen = self.pet._screen_geometry()
         self.pet.move(
             screen.right() - self.pet.width() + 1,
