@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from PIL import Image
-from PySide6.QtCore import QRect
+from PySide6.QtCore import QPoint, QPointF, QRect, Qt
 from PySide6.QtWidgets import QApplication
 
 from main import DesktopPet
@@ -78,6 +78,61 @@ class DesktopPetTests(unittest.TestCase):
         self.pet._typing_timer.stop()
         self.pet._typing_deadline = 0.0
         self.pet._stop_pose_sequence()
+
+    def test_local_mouse_press_is_not_echoed_as_a_global_click(self):
+        self.pet._typing_timer.stop()
+        self.pet._stop_pose_sequence()
+        self.pet._input_echo_enabled = True
+        self.pet._dragging = False
+        self.pet._press_global = self.pet.mapToGlobal(self.pet.rect().center())
+        try:
+            self.pet.react_to_mouse_click("left")
+            self.assertIsNone(self.pet._active_pose)
+            self.assertIsNone(self.pet._pose_mode)
+            self.assertFalse(self.pet._pose_timer.isActive())
+        finally:
+            self.pet._press_global = None
+
+    def test_drag_start_cancels_a_stale_pose_anchor(self):
+        class MoveEvent:
+            def __init__(self, global_position):
+                self._global_position = QPointF(global_position)
+                self.accepted = False
+
+            def globalPosition(self):
+                return self._global_position
+
+            def buttons(self):
+                return Qt.MouseButton.LeftButton
+
+            def accept(self):
+                self.accepted = True
+
+        self.pet._typing_timer.stop()
+        self.pet._stop_pose_sequence()
+        self.pet.set_pet_height(300)
+        self.pet.move(420, 300)
+        drag_origin = self.pet.frameGeometry().topLeft()
+        press_global = QPoint(500, 500)
+        delta = QPoint(QApplication.startDragDistance() + 20, 16)
+        self.pet._press_global = press_global
+        self.pet._drag_origin = drag_origin
+        self.pet._dragging = False
+
+        self.pet._start_pose_sequence([("mouse_ready", 1000)], "mouse")
+        event = MoveEvent(press_global + delta)
+        try:
+            self.pet.mouseMoveEvent(event)
+            self.assertTrue(event.accepted)
+            self.assertTrue(self.pet._dragging)
+            self.assertIsNone(self.pet._active_pose)
+            self.assertFalse(self.pet._pose_timer.isActive())
+            self.assertEqual(self.pet.pos(), drag_origin + delta)
+        finally:
+            self.pet._press_global = None
+            self.pet._drag_origin = None
+            self.pet._dragging = False
+            self.pet._stop_pose_sequence()
 
     def test_input_pose_transitions_do_not_move_pet_left(self):
         self.pet._typing_timer.stop()

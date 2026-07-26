@@ -37,7 +37,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 
 APP_NAME = "豆豆桌宠"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 DEFAULT_PET_HEIGHT = 300
 MIN_PET_HEIGHT = 120
 MAX_PET_HEIGHT = 520
@@ -838,8 +838,19 @@ class DesktopPet(QWidget):
     def mouseMoveEvent(self, event):
         if self._press_global is not None and event.buttons() & Qt.MouseButton.LeftButton:
             delta = event.globalPosition().toPoint() - self._press_global
-            if delta.manhattanLength() >= QApplication.startDragDistance():
+            if (
+                not self._dragging
+                and delta.manhattanLength() >= QApplication.startDragDistance()
+            ):
                 self._dragging = True
+                # The global watcher can see this same press before Qt decides
+                # it is a drag. Clear any reaction using the old position as
+                # its anchor before moving the pet.
+                self._typing_timer.stop()
+                self._typing_deadline = 0.0
+                self._stop_animation()
+                self._stop_pose_sequence()
+                self.bubble.hide()
             if self._dragging:
                 self.move(self._drag_origin + delta)
                 event.accept()
@@ -1078,7 +1089,11 @@ class DesktopPet(QWidget):
         self._show_bubble(random.choice(self.DIALOGUES[kind]))
 
     def react_to_mouse_click(self, button):
-        if not self._input_echo_enabled or self._dragging:
+        if (
+            not self._input_echo_enabled
+            or self._press_global is not None
+            or self._dragging
+        ):
             return
         del button
         self._reset_idle_timer()
