@@ -36,11 +36,11 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 
-APP_NAME = "小白桌宠"
-APP_VERSION = "1.3.1"
-DEFAULT_PET_HEIGHT = 340
-MIN_PET_HEIGHT = 150
-MAX_PET_HEIGHT = 680
+APP_NAME = "豆豆桌宠"
+APP_VERSION = "1.4.0"
+DEFAULT_PET_HEIGHT = 300
+MIN_PET_HEIGHT = 120
+MAX_PET_HEIGHT = 520
 
 
 def resource_path(relative_path):
@@ -343,21 +343,21 @@ class DesktopPet(QWidget):
             "晃一晃，灵感就来啦！",
         ],
         "mouse": [
-            "你点一下，我也点一下！",
+            "你点一下，豆豆也点一下！",
             "咔哒！这个我也会。",
             "鼠标交给我，效率汪汪涨！",
             "点到哪里，快乐跟到哪里。",
         ],
         "keyboard": [
-            "你敲字，我负责加速！",
+            "你敲字，豆豆负责加速！",
             "噼里啪啦，灵感来啦！",
             "键盘搭子已上线。",
             "这段代码一定很厉害！",
             "继续敲，我在旁边伴奏～",
         ],
         "idle": [
-            "忙完记得摸摸我。",
-            "我在认真帮你看桌面。",
+            "忙完记得摸摸豆豆。",
+            "豆豆在认真帮你看桌面。",
             "休息十秒，也算充电。",
             "今天也要对自己好一点。",
         ],
@@ -365,7 +365,22 @@ class DesktopPet(QWidget):
 
     def __init__(self, enable_system_input=True):
         super().__init__(None)
-        self.settings = QSettings("Codex", "XiaobaiDesktopPet")
+        self.settings = QSettings("Codex", "DoudouDesktopPet")
+        if not self.settings.contains("settings_initialized"):
+            legacy_settings = QSettings("Codex", "XiaobaiDesktopPet")
+            for key in (
+                "position",
+                "topmost",
+                "input_echo_enabled",
+                "idle_enabled",
+                "idle_interval_seconds",
+                "idle_actions",
+            ):
+                if legacy_settings.contains(key):
+                    self.settings.setValue(key, legacy_settings.value(key))
+            self.settings.setValue("pet_height", DEFAULT_PET_HEIGHT)
+            self.settings.setValue("settings_initialized", True)
+            self.settings.sync()
         self._topmost = self.settings.value("topmost", True, type=bool)
         self._input_echo_enabled = self.settings.value(
             "input_echo_enabled", True, type=bool
@@ -880,11 +895,11 @@ class DesktopPet(QWidget):
 
         size_menu = menu.addMenu("调整大小")
         size_options = [
-            ("迷你（220）", 220),
-            ("小巧（280）", 280),
-            ("标准（340）", 340),
-            ("大号（430）", 430),
-            ("超大（540）", 540),
+            ("迷你（约 90×150）", 150),
+            ("小巧（约 120×200）", 200),
+            ("标准（约 155×260）", 260),
+            ("推荐（约 180×300）", 300),
+            ("大号（约 220×365）", 365),
         ]
         for label, height in size_options:
             action = QAction(label, size_menu)

@@ -9,7 +9,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 & $python -m PyInstaller --noconfirm --clean (Join-Path $projectRoot "pet.spec")
 $pyInstallerExitCode = $LASTEXITCODE
-$builtExe = Join-Path $projectRoot "dist\XiaobaiDesktopPet.exe"
+$builtExe = Join-Path $projectRoot "dist\DoudouDesktopPet.exe"
 $temporaryExe = "$builtExe.notanexecutable"
 
 if ($pyInstallerExitCode -ne 0 -and (Test-Path -LiteralPath $temporaryExe)) {
@@ -26,8 +26,8 @@ if ($pyInstallerExitCode -ne 0) {
 }
 
 $finalFileName = -join @(
-    [char]0x5C0F,
-    [char]0x767D,
+    [char]0x8C46,
+    [char]0x8C46,
     [char]0x684C,
     [char]0x5BA0,
     ".exe"
