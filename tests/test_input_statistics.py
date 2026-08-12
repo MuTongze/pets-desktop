@@ -2,14 +2,17 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QDate
 from PySide6.QtWidgets import QApplication
 
 from input_statistics import (
+    DAILY_RETENTION_DAYS,
+    InputStatisticsDialog,
     InputStatisticsStore,
     KEYBOARD_SPECS,
     VISIBLE_KEY_IDS,
@@ -91,6 +94,77 @@ class InputStatisticsTests(unittest.TestCase):
                 self.assertEqual(reloaded.snapshot("total"), total)
             finally:
                 reloaded.close_store()
+
+    def test_daily_history_rolls_over_after_365_days_without_reducing_total(self):
+        current_day = [date(2025, 1, 1)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rolling-stats.json"
+            store = InputStatisticsStore(
+                path, date_provider=lambda: current_day[0]
+            )
+            first_day = current_day[0]
+            for offset in range(370):
+                current_day[0] = first_day + timedelta(days=offset)
+                store.record_key("a")
+
+            earliest_retained = current_day[0] - timedelta(
+                days=DAILY_RETENTION_DAYS - 1
+            )
+            self.assertEqual(len(store._days), DAILY_RETENTION_DAYS)
+            self.assertEqual(
+                store.snapshot("total")["keys"]["a"], 370
+            )
+            self.assertEqual(
+                store.snapshot("day", first_day)["keys"], {}
+            )
+            self.assertEqual(
+                store.snapshot("day", earliest_retained)["keys"]["a"], 1
+            )
+            self.assertTrue(store.flush())
+            store.close_store()
+
+            with path.open("r", encoding="utf-8") as source:
+                payload = json.load(source)
+            self.assertEqual(len(payload["days"]), DAILY_RETENTION_DAYS)
+            self.assertNotIn(first_day.isoformat(), payload["days"])
+            self.assertEqual(payload["total"]["keys"]["a"], 370)
+
+    def test_dialog_can_view_a_previous_day_and_defaults_to_today(self):
+        current_day = [date.today() - timedelta(days=1)]
+        with tempfile.TemporaryDirectory() as directory:
+            store = InputStatisticsStore(
+                Path(directory) / "history-stats.json",
+                date_provider=lambda: current_day[0],
+            )
+            store.record_key("a")
+            store.record_key("a")
+            previous_day = current_day[0]
+            current_day[0] = date.today()
+            store.record_key("b")
+
+            dialog = InputStatisticsDialog(store)
+            try:
+                dialog.date_edit.setDate(
+                    QDate(
+                        previous_day.year,
+                        previous_day.month,
+                        previous_day.day,
+                    )
+                )
+                dialog._set_mode("day")
+                self.assertEqual(dialog.keyboard_metric.value_label.text(), "2")
+                self.assertIn("历史记录", dialog.subtitle.text())
+
+                dialog._set_mode("total")
+                self.assertEqual(dialog.keyboard_metric.value_label.text(), "3")
+
+                dialog.show()
+                self.app.processEvents()
+                self.assertEqual(dialog._mode, "day")
+                self.assertEqual(dialog.date_edit.date(), QDate.currentDate())
+            finally:
+                dialog.close()
+                store.close_store()
 
 
 if __name__ == "__main__":

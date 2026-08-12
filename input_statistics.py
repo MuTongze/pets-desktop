@@ -2,13 +2,14 @@ import json
 import math
 import os
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRectF, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QDate, QObject, QRectF, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QDateEdit,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -25,6 +26,7 @@ STATISTICS_FILENAME = "豆豆桌宠输入统计.json"
 STATISTICS_VERSION = 1
 IDLE_FLUSH_MILLISECONDS = 8_000
 MAX_FLUSH_MILLISECONDS = 60_000
+DAILY_RETENTION_DAYS = 365
 
 
 KEY_LABELS = {
@@ -242,6 +244,7 @@ class InputStatisticsStore(QObject):
         self._days = {}
         self._total = {"keys": {}, "mouse": {}}
         self._dirty = False
+        self._last_prune_day = None
         self.last_error = None
         self.last_flush_at = None
 
@@ -256,9 +259,39 @@ class InputStatisticsStore(QObject):
         self._max_flush_timer.start()
         self._load()
 
-    def _today_key(self):
+    def _current_date(self):
         value = self._date_provider()
-        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        return date.fromisoformat(str(value))
+
+    def _today_key(self):
+        return self._current_date().isoformat()
+
+    def _prune_old_days(self):
+        current_date = self._current_date()
+        current_day = current_date.isoformat()
+        if self._last_prune_day == current_day:
+            return 0
+        self._last_prune_day = current_day
+        cutoff = current_date - timedelta(days=DAILY_RETENTION_DAYS - 1)
+        expired = []
+        for day_key in self._days:
+            try:
+                stored_date = date.fromisoformat(day_key)
+            except ValueError:
+                expired.append(day_key)
+                continue
+            if stored_date < cutoff:
+                expired.append(day_key)
+        for day_key in expired:
+            del self._days[day_key]
+        if expired:
+            self._dirty = True
+            self._idle_flush_timer.start()
+        return len(expired)
 
     def _load(self):
         if not self.path.exists():
@@ -291,8 +324,10 @@ class InputStatisticsStore(QObject):
                 "keys": dict(total["keys"]),
                 "mouse": dict(total["mouse"]),
             }
+        self._prune_old_days()
 
     def _increment(self, kind, item):
+        self._prune_old_days()
         day_key = self._today_key()
         day = self._days.setdefault(day_key, {"keys": {}, "mouse": {}})
         day[kind][item] = day[kind].get(item, 0) + 1
@@ -310,19 +345,25 @@ class InputStatisticsStore(QObject):
         if button in ("left", "middle", "right"):
             self._increment("mouse", button)
 
-    def snapshot(self, mode="today"):
+    def snapshot(self, mode="today", day=None):
+        self._prune_old_days()
         if mode == "total":
             source = self._total
         else:
-            source = self._days.get(
-                self._today_key(), {"keys": {}, "mouse": {}}
-            )
+            if day is None:
+                day_key = self._today_key()
+            elif hasattr(day, "isoformat"):
+                day_key = day.isoformat()
+            else:
+                day_key = str(day)
+            source = self._days.get(day_key, {"keys": {}, "mouse": {}})
         return {
             "keys": dict(source["keys"]),
             "mouse": dict(source["mouse"]),
         }
 
     def flush(self):
+        self._prune_old_days()
         if not self._dirty:
             return True
         payload = {
@@ -637,7 +678,7 @@ class InputStatisticsDialog(QDialog):
     def __init__(self, store, parent=None):
         super().__init__(parent)
         self.store = store
-        self._mode = "today"
+        self._mode = "day"
         self.setWindowTitle("输入足迹 · 豆豆桌宠")
         self.setMinimumSize(980, 650)
         self.resize(1180, 735)
@@ -657,6 +698,22 @@ class InputStatisticsDialog(QDialog):
                 padding: 8px 18px; color: #7c675a; font: 600 9.5pt "Microsoft YaHei UI";
             }
             QPushButton#segment:checked { background: #4c3a30; color: #fffaf3; }
+            QFrame#dateSelector {
+                background: #fffaf3; border: 1px solid #e4d5c4; border-radius: 11px;
+            }
+            QPushButton#dateNav {
+                background: transparent; border: none; border-radius: 7px;
+                min-width: 26px; max-width: 26px; min-height: 28px;
+                color: #6e584a; font: 700 14pt "Segoe UI";
+            }
+            QPushButton#dateNav:hover { background: #f1dfcc; }
+            QPushButton#dateNav:disabled { color: #cbbcaf; }
+            QDateEdit#dateEdit {
+                background: transparent; border: none; padding: 5px 4px;
+                color: #4c3a30; font: 600 9.5pt "Microsoft YaHei UI";
+                selection-background-color: #e98562;
+            }
+            QDateEdit#dateEdit::drop-down { border: none; width: 20px; }
             QFrame#metricCard, QFrame#accentCard, QFrame#mouseCard {
                 background: #fffaf3; border: 1px solid #eadbca; border-radius: 14px;
             }
@@ -691,6 +748,32 @@ class InputStatisticsDialog(QDialog):
         header.addLayout(title_layout)
         header.addStretch()
 
+        self.date_controls = QFrame()
+        self.date_controls.setObjectName("dateSelector")
+        date_layout = QHBoxLayout(self.date_controls)
+        date_layout.setContentsMargins(4, 2, 5, 2)
+        date_layout.setSpacing(1)
+        self.previous_date_button = QPushButton("‹")
+        self.previous_date_button.setObjectName("dateNav")
+        self.previous_date_button.setToolTip("前一天")
+        self.date_edit = QDateEdit()
+        self.date_edit.setObjectName("dateEdit")
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setMinimumWidth(126)
+        self.next_date_button = QPushButton("›")
+        self.next_date_button.setObjectName("dateNav")
+        self.next_date_button.setToolTip("后一天")
+        date_layout.addWidget(self.previous_date_button)
+        date_layout.addWidget(self.date_edit)
+        date_layout.addWidget(self.next_date_button)
+        self.previous_date_button.clicked.connect(lambda: self._shift_date(-1))
+        self.next_date_button.clicked.connect(lambda: self._shift_date(1))
+        self.date_edit.dateChanged.connect(self._date_changed)
+        self._sync_date_limits(reset_to_today=True)
+        header.addWidget(self.date_controls)
+        header.addSpacing(8)
+
         segment_frame = QFrame()
         segment_frame.setStyleSheet(
             "QFrame { background: #eadfd2; border-radius: 11px; padding: 2px; }"
@@ -698,17 +781,17 @@ class InputStatisticsDialog(QDialog):
         segment_layout = QHBoxLayout(segment_frame)
         segment_layout.setContentsMargins(2, 2, 2, 2)
         segment_layout.setSpacing(1)
-        self.today_button = QPushButton("今日")
+        self.daily_button = QPushButton("每日")
         self.total_button = QPushButton("累计")
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
-        for button in (self.today_button, self.total_button):
+        for button in (self.daily_button, self.total_button):
             button.setObjectName("segment")
             button.setCheckable(True)
             self._mode_group.addButton(button)
             segment_layout.addWidget(button)
-        self.today_button.setChecked(True)
-        self.today_button.clicked.connect(lambda: self._set_mode("today"))
+        self.daily_button.setChecked(True)
+        self.daily_button.clicked.connect(lambda: self._set_mode("day"))
         self.total_button.clicked.connect(lambda: self._set_mode("total"))
         header.addWidget(segment_frame)
         root.addLayout(header)
@@ -761,7 +844,9 @@ class InputStatisticsDialog(QDialog):
             mouse_layout.addWidget(card, 1)
         root.addLayout(mouse_layout)
 
-        self.footer = QLabel("只统计按键标识与次数，不记录输入内容；数据仅保存在本机。")
+        self.footer = QLabel(
+            "只统计按键标识与次数，不记录输入内容；每日明细滚动保留最近 365 天。"
+        )
         self.footer.setObjectName("footer")
         root.addWidget(self.footer)
 
@@ -773,10 +858,38 @@ class InputStatisticsDialog(QDialog):
 
     def _set_mode(self, mode):
         self._mode = mode
+        self.date_controls.setVisible(mode != "total")
+        self.refresh()
+
+    def _sync_date_limits(self, reset_to_today=False):
+        today = QDate.currentDate()
+        earliest = today.addDays(-(DAILY_RETENTION_DAYS - 1))
+        signals_were_blocked = self.date_edit.blockSignals(True)
+        try:
+            self.date_edit.setDateRange(earliest, today)
+            if (
+                reset_to_today
+                or self.date_edit.date() < earliest
+                or self.date_edit.date() > today
+            ):
+                self.date_edit.setDate(today)
+        finally:
+            self.date_edit.blockSignals(signals_were_blocked)
+        self.previous_date_button.setEnabled(self.date_edit.date() > earliest)
+        self.next_date_button.setEnabled(self.date_edit.date() < today)
+
+    def _shift_date(self, days):
+        self.date_edit.setDate(self.date_edit.date().addDays(int(days)))
+
+    def _date_changed(self, selected_date):
+        del selected_date
+        self._sync_date_limits()
         self.refresh()
 
     def refresh(self):
-        snapshot = self.store.snapshot(self._mode)
+        self._sync_date_limits()
+        selected_day = self.date_edit.date().toString(Qt.DateFormat.ISODate)
+        snapshot = self.store.snapshot(self._mode, selected_day)
         keys = snapshot["keys"]
         mouse = snapshot["mouse"]
         keyboard_total = sum(keys.values())
@@ -790,10 +903,11 @@ class InputStatisticsDialog(QDialog):
             if key_id in VISIBLE_KEY_IDS and count > 0
         )
 
-        if self._mode == "today":
-            self.subtitle.setText(
-                "{} · 记录今天每一次真实按下".format(self.store._today_key())
-            )
+        if self._mode == "day":
+            if selected_day == self.store._today_key():
+                self.subtitle.setText("{} · 今日".format(selected_day))
+            else:
+                self.subtitle.setText("{} · 历史记录".format(selected_day))
         else:
             self.subtitle.setText("从开始使用统计功能至今")
         self.keyboard_metric.set_value("{:,}".format(keyboard_total), "次按下")
@@ -826,9 +940,15 @@ class InputStatisticsDialog(QDialog):
         if self.store.last_error:
             self.footer.setText("统计仍保留在内存中，但暂时无法写入本机文件：{}".format(self.store.last_error))
         else:
-            self.footer.setText("只统计按键标识与次数，不记录输入内容；数据仅保存在本机。")
+            self.footer.setText(
+                "只统计按键标识与次数，不记录输入内容；每日明细滚动保留最近 365 天。"
+            )
 
     def showEvent(self, event):
+        self._mode = "day"
+        self.daily_button.setChecked(True)
+        self.date_controls.show()
+        self._sync_date_limits(reset_to_today=True)
         self.refresh()
         self._refresh_timer.start()
         super().showEvent(event)

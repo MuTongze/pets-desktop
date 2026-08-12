@@ -68,7 +68,7 @@ from input_statistics import (
 
 
 APP_NAME = "豆豆桌宠"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 DEFAULT_PET_HEIGHT = 150
 MIN_PET_HEIGHT = 90
 MAX_PET_HEIGHT = 365
