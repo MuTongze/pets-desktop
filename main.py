@@ -5,8 +5,10 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 import winreg
+from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -21,6 +23,7 @@ from PySide6.QtCore import (
     QTemporaryDir,
     QTimer,
     Qt,
+    Slot,
     QVariantAnimation,
 )
 from PySide6.QtGui import (
@@ -55,9 +58,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from input_statistics import (
+    InputStatisticsDialog,
+    InputStatisticsStore,
+    POLL_KEY_CODES,
+    STATISTICS_FILENAME,
+    normalize_windows_key,
+)
+
 
 APP_NAME = "豆豆桌宠"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 DEFAULT_PET_HEIGHT = 150
 MIN_PET_HEIGHT = 90
 MAX_PET_HEIGHT = 365
@@ -148,57 +159,6 @@ def set_autostart_enabled(enabled):
         pass
 
 
-LEGACY_SETTINGS_APPS = ("DoudouDesktopPet", "XiaobaiDesktopPet")
-LEGACY_SETTINGS_KEYS = (
-    "position",
-    "pet_height",
-    "topmost",
-    "input_echo_enabled",
-    "idle_enabled",
-    "idle_interval_seconds",
-    "idle_actions",
-    "dialogues_json",
-    "settings_initialized",
-    "size_preset_version",
-)
-
-
-def migrate_legacy_registry_settings(target_settings):
-    legacy_sources = [
-        QSettings("Codex", application_name)
-        for application_name in LEGACY_SETTINGS_APPS
-    ]
-    for key in LEGACY_SETTINGS_KEYS:
-        if target_settings.contains(key):
-            continue
-        for legacy_settings in legacy_sources:
-            if legacy_settings.contains(key):
-                target_settings.setValue(key, legacy_settings.value(key))
-                break
-
-    target_settings.setValue("settings_initialized", True)
-    target_settings.sync()
-    if target_settings.status() != QSettings.Status.NoError:
-        return False
-
-    for legacy_settings in legacy_sources:
-        legacy_settings.clear()
-        legacy_settings.sync()
-    for application_name in LEGACY_SETTINGS_APPS:
-        try:
-            winreg.DeleteKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Codex\{}".format(application_name),
-            )
-        except OSError:
-            pass
-    try:
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Codex")
-    except OSError:
-        pass
-    return True
-
-
 def clamp(value, minimum, maximum):
     return max(minimum, min(value, maximum))
 
@@ -208,93 +168,234 @@ def smoothstep(value):
     return value * value * (3.0 - 2.0 * value)
 
 
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", wintypes.POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
 class GlobalInputWatcher(QObject):
-    """Observe input transitions without recording text or injecting input."""
+    """Observe physical input without recording text or injecting input."""
 
     mouse_clicked = Signal(str)
     key_pressed = Signal()
+    key_pressed_detailed = Signal(str)
     activity_detected = Signal()
+    _hook_failed = Signal()
 
-    KEYBOARD_KEYS = tuple(
-        list(range(0x30, 0x5B))
-        + list(range(0x70, 0x7C))
-        + [
-            0x08,  # Backspace
-            0x09,  # Tab
-            0x0D,  # Enter
-            0x1B,  # Escape
-            0x20,  # Space
-            0x21,  # Page Up
-            0x22,  # Page Down
-            0x23,  # End
-            0x24,  # Home
-            0x25,  # Left
-            0x26,  # Up
-            0x27,  # Right
-            0x28,  # Down
-            0x2D,  # Insert
-            0x2E,  # Delete
-            0xBA,
-            0xBB,
-            0xBC,
-            0xBD,
-            0xBE,
-            0xBF,
-            0xC0,
-            0xDB,
-            0xDC,
-            0xDD,
-            0xDE,
-        ]
-    )
     MOUSE_BUTTONS = {"left": 0x01, "right": 0x02, "middle": 0x04}
+    _MOUSE_DOWN_MESSAGES = {
+        0x0201: "left",  # WM_LBUTTONDOWN
+        0x0204: "right",  # WM_RBUTTONDOWN
+        0x0207: "middle",  # WM_MBUTTONDOWN
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._supported = sys.platform == "win32"
         self._enabled = False
         self._user32 = ctypes.windll.user32 if self._supported else None
+        self._kernel32 = ctypes.windll.kernel32 if self._supported else None
+        self._hook_thread = None
+        self._hook_thread_id = None
+        self._keyboard_hook = None
+        self._mouse_hook = None
+        self._keyboard_callback = None
+        self._mouse_callback = None
+        self._pressed_keys = set()
+        self._last_mouse_activity = 0.0
+
         self._key_states = {}
         self._mouse_states = {}
         self._last_cursor_pos = None
-        self._timer = QTimer(self)
-        self._timer.setInterval(28)
-        self._timer.timeout.connect(self._poll)
+        self._using_fallback = False
+        self._fallback_timer = QTimer(self)
+        self._fallback_timer.setInterval(16)
+        self._fallback_timer.timeout.connect(self._poll_fallback)
+        self._hook_failed.connect(self._start_polling_fallback)
 
     def _is_down(self, virtual_key):
         return bool(self._user32.GetAsyncKeyState(virtual_key) & 0x8000)
 
-    def _snapshot(self):
-        if not self._supported:
+    def set_enabled(self, enabled):
+        enabled = bool(enabled and self._supported)
+        if enabled:
+            if self._enabled and (
+                self._using_fallback
+                or (self._hook_thread is not None and self._hook_thread.is_alive())
+            ):
+                return
+            self._enabled = True
+            self._ensure_hook_running()
             return
+
+        self._enabled = False
+        self._fallback_timer.stop()
+        self._using_fallback = False
+        self._key_states.clear()
+        self._mouse_states.clear()
+        self._pressed_keys.clear()
+        self._last_cursor_pos = None
+        thread_id = self._hook_thread_id
+        if thread_id:
+            self._user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)  # WM_QUIT
+
+    def _ensure_hook_running(self):
+        if not self._enabled or self._using_fallback:
+            return
+        if self._hook_thread is not None and self._hook_thread.is_alive():
+            QTimer.singleShot(50, self._ensure_hook_running)
+            return
+        self._hook_thread = threading.Thread(
+            target=self._run_hooks,
+            name="DoudouInputHooks",
+            daemon=True,
+        )
+        self._hook_thread.start()
+
+    def _run_hooks(self):
+        hook_proc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
+        user32 = self._user32
+        kernel32 = self._kernel32
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int,
+            hook_proc_type,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        ]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+
+        message = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+        self._hook_thread_id = kernel32.GetCurrentThreadId()
+        if not self._enabled:
+            self._hook_thread_id = None
+            return
+
+        def keyboard_proc(code, message_id, data_pointer):
+            if code >= 0 and self._enabled:
+                info = ctypes.cast(
+                    data_pointer, ctypes.POINTER(_KBDLLHOOKSTRUCT)
+                ).contents
+                if not info.flags & 0x10:  # LLKHF_INJECTED
+                    key_id = normalize_windows_key(
+                        info.vkCode, info.scanCode, info.flags
+                    )
+                    if message_id in (0x0100, 0x0104):  # KEYDOWN / SYSKEYDOWN
+                        if key_id not in self._pressed_keys:
+                            self._pressed_keys.add(key_id)
+                            self.key_pressed_detailed.emit(key_id)
+                            self.key_pressed.emit()
+                            self.activity_detected.emit()
+                    elif message_id in (0x0101, 0x0105):  # KEYUP / SYSKEYUP
+                        self._pressed_keys.discard(key_id)
+            return user32.CallNextHookEx(None, code, message_id, data_pointer)
+
+        def mouse_proc(code, message_id, data_pointer):
+            if code >= 0 and self._enabled:
+                info = ctypes.cast(
+                    data_pointer, ctypes.POINTER(_MSLLHOOKSTRUCT)
+                ).contents
+                if not info.flags & 0x01:  # LLMHF_INJECTED
+                    button = self._MOUSE_DOWN_MESSAGES.get(message_id)
+                    if button:
+                        self.mouse_clicked.emit(button)
+                        self.activity_detected.emit()
+                    elif message_id == 0x0200:  # WM_MOUSEMOVE
+                        now = time.monotonic()
+                        if now - self._last_mouse_activity >= 0.25:
+                            self._last_mouse_activity = now
+                            self.activity_detected.emit()
+            return user32.CallNextHookEx(None, code, message_id, data_pointer)
+
+        self._keyboard_callback = hook_proc_type(keyboard_proc)
+        self._mouse_callback = hook_proc_type(mouse_proc)
+        module_handle = kernel32.GetModuleHandleW(None)
+        self._keyboard_hook = user32.SetWindowsHookExW(
+            13, self._keyboard_callback, module_handle, 0
+        )
+        self._mouse_hook = user32.SetWindowsHookExW(
+            14, self._mouse_callback, module_handle, 0
+        )
+        if not self._keyboard_hook or not self._mouse_hook:
+            if self._keyboard_hook:
+                user32.UnhookWindowsHookEx(self._keyboard_hook)
+            if self._mouse_hook:
+                user32.UnhookWindowsHookEx(self._mouse_hook)
+            self._keyboard_hook = None
+            self._mouse_hook = None
+            self._hook_thread_id = None
+            self._hook_failed.emit()
+            return
+
+        try:
+            while self._enabled:
+                result = user32.GetMessageW(
+                    ctypes.byref(message), None, 0, 0
+                )
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        finally:
+            if self._keyboard_hook:
+                user32.UnhookWindowsHookEx(self._keyboard_hook)
+            if self._mouse_hook:
+                user32.UnhookWindowsHookEx(self._mouse_hook)
+            self._keyboard_hook = None
+            self._mouse_hook = None
+            self._hook_thread_id = None
+            self._pressed_keys.clear()
+
+    @Slot()
+    def _start_polling_fallback(self):
+        if not self._enabled:
+            return
+        self._using_fallback = True
         self._key_states = {
             virtual_key: self._is_down(virtual_key)
-            for virtual_key in self.KEYBOARD_KEYS
+            for virtual_key in POLL_KEY_CODES
         }
         self._mouse_states = {
             name: self._is_down(virtual_key)
             for name, virtual_key in self.MOUSE_BUTTONS.items()
         }
         self._last_cursor_pos = QCursor.pos()
+        self._fallback_timer.start()
 
-    def set_enabled(self, enabled):
-        enabled = bool(enabled and self._supported)
-        if enabled == self._enabled:
-            return
-        self._enabled = enabled
-        if enabled:
-            self._snapshot()
-            self._timer.start()
-        else:
-            self._timer.stop()
-            self._key_states.clear()
-            self._mouse_states.clear()
-            self._last_cursor_pos = None
-
-    def _poll(self):
+    def _poll_fallback(self):
         if not self._enabled:
             return
-
         activity = False
         cursor_pos = QCursor.pos()
         if self._last_cursor_pos is not None and cursor_pos != self._last_cursor_pos:
@@ -308,15 +409,14 @@ class GlobalInputWatcher(QObject):
                 activity = True
             self._mouse_states[name] = is_down
 
-        any_new_key = False
-        for virtual_key in self.KEYBOARD_KEYS:
+        for virtual_key in POLL_KEY_CODES:
             is_down = self._is_down(virtual_key)
             if is_down and not self._key_states.get(virtual_key, False):
-                any_new_key = True
+                key_id = normalize_windows_key(virtual_key)
+                self.key_pressed_detailed.emit(key_id)
+                self.key_pressed.emit()
+                activity = True
             self._key_states[virtual_key] = is_down
-        if any_new_key:
-            self.key_pressed.emit()
-            activity = True
         if activity:
             self.activity_detected.emit()
 
@@ -694,12 +794,9 @@ class DesktopPet(QWidget):
         self,
         enable_system_input=True,
         settings=None,
-        migrate_legacy=True,
     ):
         super().__init__(None)
         self.settings = settings or file_settings()
-        if migrate_legacy:
-            migrate_legacy_registry_settings(self.settings)
         if not self.settings.contains("settings_initialized"):
             self.settings.setValue("settings_initialized", True)
             self.settings.sync()
@@ -758,6 +855,8 @@ class DesktopPet(QWidget):
         self._typing_deadline = 0.0
         self._last_input_bubble = 0.0
         self._last_key_bob = 0.0
+        self._input_reactions_suspended = False
+        self._statistics_dialog = None
 
         self.pet_pixmap = QPixmap(str(resource_path("assets/pet_cropped.png")))
         if self.pet_pixmap.isNull():
@@ -790,9 +889,17 @@ class DesktopPet(QWidget):
             self.setWindowIcon(QIcon(str(icon_path)))
 
         self.bubble = SpeechBubble()
+        statistics_path = Path(self.settings.fileName()).resolve().with_name(
+            STATISTICS_FILENAME
+        )
+        self.statistics = InputStatisticsStore(statistics_path, self)
         self.input_watcher = GlobalInputWatcher(self)
         self.input_watcher.mouse_clicked.connect(self.react_to_mouse_click)
+        self.input_watcher.mouse_clicked.connect(self.statistics.record_mouse)
         self.input_watcher.key_pressed.connect(self.react_to_keyboard_press)
+        self.input_watcher.key_pressed_detailed.connect(
+            self.statistics.record_key
+        )
         self.input_watcher.activity_detected.connect(self._reset_idle_timer)
 
         self._typing_timer = QTimer(self)
@@ -1310,6 +1417,10 @@ class DesktopPet(QWidget):
         dialogue_action.triggered.connect(self.edit_dialogues)
         menu.addAction(dialogue_action)
 
+        statistics_action = QAction("键鼠统计…", menu)
+        statistics_action.triggered.connect(self.show_input_statistics)
+        menu.addAction(statistics_action)
+
         input_echo_action = QAction("跟随鼠标和键盘", menu)
         input_echo_action.setCheckable(True)
         input_echo_action.setChecked(self._input_echo_enabled)
@@ -1405,7 +1516,7 @@ class DesktopPet(QWidget):
         self._save_dialogues()
 
     def edit_dialogues(self):
-        self.input_watcher.set_enabled(False)
+        self._input_reactions_suspended = True
         self._typing_timer.stop()
         self._typing_deadline = 0.0
         self._stop_pose_sequence()
@@ -1423,13 +1534,20 @@ class DesktopPet(QWidget):
                 self._show_bubble("对话已经保存，豆豆记住啦！")
         finally:
             dialog.deleteLater()
+            self._input_reactions_suspended = False
             self._refresh_input_watcher()
 
+    def show_input_statistics(self):
+        if self._statistics_dialog is None:
+            self._statistics_dialog = InputStatisticsDialog(
+                self.statistics, self
+            )
+        self._statistics_dialog.show()
+        self._statistics_dialog.raise_()
+        self._statistics_dialog.activateWindow()
+
     def _refresh_input_watcher(self):
-        self.input_watcher.set_enabled(
-            self._enable_system_input
-            and (self._input_echo_enabled or self._idle_enabled)
-        )
+        self.input_watcher.set_enabled(self._enable_system_input)
 
     def set_idle_enabled(self, enabled):
         self._idle_enabled = bool(enabled)
@@ -1524,6 +1642,7 @@ class DesktopPet(QWidget):
     def react_to_mouse_click(self, button):
         if (
             not self._input_echo_enabled
+            or self._input_reactions_suspended
             or self._press_global is not None
             or self._dragging
         ):
@@ -1543,7 +1662,11 @@ class DesktopPet(QWidget):
         self._maybe_show_input_bubble("mouse", 5.0)
 
     def react_to_keyboard_press(self):
-        if not self._input_echo_enabled or self._dragging:
+        if (
+            not self._input_echo_enabled
+            or self._input_reactions_suspended
+            or self._dragging
+        ):
             return
         now = time.monotonic()
         new_burst = now >= self._typing_deadline
@@ -1801,14 +1924,21 @@ class DesktopPet(QWidget):
             "idle_actions", ",".join(sorted(self._enabled_idle_actions))
         )
         self.settings.sync()
+        self.statistics.flush()
 
-    def closeEvent(self, event):
+    def shutdown(self):
         self.input_watcher.set_enabled(False)
         self._idle_timer.stop()
         self._typing_timer.stop()
         self._pose_timer.stop()
         self._stop_overlay_animation()
         self.save_settings()
+        self.statistics.close_store()
+
+    def closeEvent(self, event):
+        self.shutdown()
+        if self._statistics_dialog is not None:
+            self._statistics_dialog.close()
         self.bubble.close()
         super().closeEvent(event)
 
@@ -1845,9 +1975,8 @@ def main():
     pet = DesktopPet(
         enable_system_input=not smoke_test,
         settings=settings,
-        migrate_legacy=not smoke_test,
     )
-    app.aboutToQuit.connect(pet.save_settings)
+    app.aboutToQuit.connect(pet.shutdown)
     pet.show()
     pet.raise_()
 

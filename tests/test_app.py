@@ -36,7 +36,6 @@ class DesktopPetTests(unittest.TestCase):
         cls.pet = DesktopPet(
             enable_system_input=False,
             settings=settings,
-            migrate_legacy=False,
         )
 
     @classmethod
